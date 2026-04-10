@@ -12,6 +12,9 @@ except PackageNotFoundError:
     __version__ = "unknown"
 
 TrainTask = Literal["ef", "efs", "efsm"]
-PredTask = Literal["e", "ef", "em", "efs", "efsm"]
+PredTask = Literal[
+    "e", "ef", "em", "efs", "efsm",
+    "ej", "efj", "emj", "efsj", "efsmj",
+]
 
 ROOT = os.path.dirname(os.path.dirname(__file__))

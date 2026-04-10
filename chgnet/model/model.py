@@ -66,6 +66,7 @@ class CHGNet(nn.Module):
         learnable_rbf: bool = True,
         gMLP_norm: str | None = "layer",  # noqa: N803
         readout_norm: str | None = "layer",
+        exchange_head_hidden_dims: Sequence[int] | int | None = None,
         version: str | None = None,
         **kwargs,
     ) -> None:
@@ -314,6 +315,16 @@ class CHGNet(nn.Module):
                 nn.Linear(in_features=mlp_hidden_dims[-1], out_features=1),
             )
 
+        # Exchange coupling head (optional; activated when exchange_head_hidden_dims is set)
+        self.exchange_head: MLP | None = None
+        if exchange_head_hidden_dims is not None:
+            self.exchange_head = MLP(
+                input_dim=bond_fea_dim,
+                hidden_dim=exchange_head_hidden_dims,
+                output_dim=1,
+                activation=non_linearity,
+            )
+
         version_str = f" v{version}" if version else ""
         print(f"CHGNet{version_str} initialized with {self.n_params:,} parameters")
 
@@ -335,6 +346,7 @@ class CHGNet(nn.Module):
         return_site_energies: bool = False,
         return_atom_feas: bool = False,
         return_crystal_feas: bool = False,
+        mag_atom_masks: list[Tensor] | None = None,
     ) -> dict[str, Tensor]:
         """Get prediction associated with input graphs
         Args:
@@ -366,6 +378,9 @@ class CHGNet(nn.Module):
         )
 
         # Pass to model
+        mag_atom_mask = (
+            torch.cat(mag_atom_masks) if mag_atom_masks is not None else None
+        )
         prediction = self._compute(
             batched_graph,
             compute_force="f" in task,
@@ -374,6 +389,8 @@ class CHGNet(nn.Module):
             return_site_energies=return_site_energies,
             return_atom_feas=return_atom_feas,
             return_crystal_feas=return_crystal_feas,
+            compute_exchange="j" in task,
+            mag_atom_mask=mag_atom_mask,
         )
         prediction["e"] += comp_energy
         if return_site_energies and self.composition_model is not None:
@@ -396,6 +413,8 @@ class CHGNet(nn.Module):
         return_site_energies: bool = False,
         return_atom_feas: bool = False,
         return_crystal_feas: bool = False,
+        compute_exchange: bool = False,
+        mag_atom_mask: Tensor | None = None,
     ) -> dict:
         """Get Energy, Force, Stress, Magmom associated with input graphs
         force = - d(Energy)/d(atom_positions)
@@ -484,6 +503,39 @@ class CHGNet(nn.Module):
                     magmom = torch.abs(self.site_wise(atom_feas))
                     prediction["m"] = list(
                         torch.split(magmom.view(-1), atoms_per_graph.tolist())
+                    )
+                # Compute per-bond exchange couplings
+                if compute_exchange and self.exchange_head is not None:
+                    j_flat = self.exchange_head(bond_feas).squeeze(-1)  # [num_undirected]
+
+                    # Build undirected→one-directed index mapping on the fly.
+                    # Scatter all directed indices to their undirected slot;
+                    # last write wins — any directed edge suffices for endpoint lookup.
+                    num_undirected = bond_feas.shape[0]
+                    u2d = torch.zeros(
+                        num_undirected, dtype=torch.long, device=bond_feas.device
+                    )
+                    u2d[g.directed2undirected.long()] = torch.arange(
+                        g.directed2undirected.shape[0], device=bond_feas.device
+                    )
+
+                    # Endpoint atom indices for every undirected bond
+                    bond_centers = g.batched_atom_graph[u2d, 0]    # [num_undirected]
+                    bond_neighbors = g.batched_atom_graph[u2d, 1]  # [num_undirected]
+
+                    # Zero couplings that involve at least one non-magnetic atom
+                    if mag_atom_mask is not None:
+                        mask = mag_atom_mask.to(device=bond_feas.device)
+                        bond_mag_mask = mask[bond_centers] & mask[bond_neighbors]
+                        j_flat = j_flat * bond_mag_mask.to(j_flat.dtype)
+
+                    # Split per structure (bond owner = graph of its center atom)
+                    bond_graph_owners = g.atom_owners[bond_centers]
+                    bonds_per_graph = torch.bincount(
+                        bond_graph_owners, minlength=atoms_per_graph.shape[0]
+                    )
+                    prediction["j"] = list(
+                        torch.split(j_flat, bonds_per_graph.tolist())
                     )
 
         # Last conv layer
