@@ -585,6 +585,8 @@ class CHGNet(nn.Module):
             # Apply scale to each stress tensor
             stress = [stress[i] * scale[i] for i in range(len(stress))]
             prediction["s"] = stress
+            # Expose strain tensors so callers can differentiate e_mag w.r.t. strain
+            prediction["strains"] = list(g.strains)
 
         # Normalize energy if model is intensive
         if self.is_intensive:
